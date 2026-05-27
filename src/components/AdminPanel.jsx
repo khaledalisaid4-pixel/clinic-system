@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebase';
 import { collection, onSnapshot, doc, updateDoc, writeBatch, setDoc, getDocs, query, where } from 'firebase/firestore';
+// 🔥 استيراد مكتبة الـ Storage لحذف الصور وإخلاء المساحة تلقائياً
+import { getStorage, ref, deleteObject } from 'firebase/storage';
 
 export default function AdminPanel() {
   const [doctors, setDoctors] = useState([]);
@@ -34,6 +36,10 @@ export default function AdminPanel() {
   const [startDate, setStartDate] = useState(new Date().toLocaleDateString('fr-CA'));
   const [endDate, setEndDate] = useState(new Date().toLocaleDateString('fr-CA'));
   const [isExporting, setIsExporting] = useState(false);
+
+  // ⚙️ حالات ميزة التنظيف الدوري وتفريغ مساحة السيرفر للمالك الرئيسي
+  const [cleanUpDate, setCleanUpDate] = useState('');
+  const [isCleaning, setIsCleaning] = useState(false);
 
   const parseAndRenderSchedule = (rawDayKey, timeValue) => {
     let dayName = rawDayKey;
@@ -272,6 +278,77 @@ export default function AdminPanel() {
     } catch (error) { console.error(error); }
   };
 
+  // 🔥 ميزة تنظيف السجلات وإخلاء المساحة الكلية مقفلة بباسورد فردي وخاص بالمالك
+  const handleDataCleanup = async () => {
+    if (!cleanUpDate) {
+      alert('الرجاء اختيار التاريخ المراد تنظيف ما قبله أولاً! 📅');
+      return;
+    }
+
+    const confirmFirst = window.confirm(`⚠️ تحذير حرج جداً:\nهل أنت متأكد من حذف كافة الحجوزات، السجلات، وإيصالات الصور التي تم إنشاؤها قبل تاريخ (${cleanUpDate}) نهائياً؟\nهذا الإجراء لا يمكن التراجع عنه أبداً وسيمسح الداتا من جذورها!`);
+    if (!confirmFirst) return;
+
+    const passwordConfirm = window.prompt('🔒 إجراء حرج: برجاء كتابة كلمة مرور المالك الرئيسي (Super Admin) لتأكيد الحذف النهائي:');
+    
+    // 🔑 الباسورد السري الخاص بك أنت فقط (تقدر تغير الكلمة دي لأي كلمة تانية تناسبك)
+    const MY_PRIVATE_PASSWORD = "KhaledClinicSecret2026"; 
+
+    if (passwordConfirm !== MY_PRIVATE_PASSWORD) {
+      alert('❌ كلمة المرور غير صحيحة! تم إلغاء العملية، هذه الصلاحية للمالك الرئيسي للمنظومة فقط.');
+      return;
+    }
+
+    setIsCleaning(true);
+    const storage = getStorage();
+
+    try {
+      // جلب الحجوزات القديمة التي تقع قبل التاريخ المختار
+      const bookingsRef = collection(db, 'bookings');
+      const q = query(bookingsRef, where('bookingDateStr', '<', cleanUpDate));
+      const querySnapshot = await getDocs(q);
+
+      if (querySnapshot.empty) {
+        alert('✨ لم يتم العثور على أي سجلات أو حجوزات قديمة قبل هذا التاريخ لتنظيفها.');
+        setIsCleaning(false);
+        return;
+      }
+
+      const batch = writeBatch(db);
+      let deletedCount = 0;
+      let imagesDeletedCount = 0;
+
+      for (const document of querySnapshot.docs) {
+        const data = document.data();
+        
+        // تفريغ مساحة الصور من الـ Firebase Storage لو الحجز فيه إيصال تحويل إلكتروني
+        if (data.screenshot && data.screenshot.includes('firebaseapps.com')) {
+          try {
+            const imageRef = ref(storage, data.screenshot);
+            await deleteObject(imageRef);
+            imagesDeletedCount++;
+          } catch (imgErr) {
+            console.error('خطأ أثناء مسح الصورة (ربما تم مسحها يدوياً سابقاً):', imgErr);
+          }
+        }
+
+        // مسح السجل النصي من الـ Firestore
+        batch.delete(doc(db, 'bookings', document.id));
+        deletedCount++;
+      }
+
+      // اعتماد الحذف الجماعي الآمن
+      await batch.commit();
+      alert(`✅ تم تنظيف السيرفر بنجاح بواسطة المالك!\n- تم حذف: ${deletedCount} سجل مريض من قاعدة البيانات.\n- تم تفريغ وإخلاء: ${imagesDeletedCount} صورة إيصال تحويل من السيرفر.`);
+      setCleanUpDate('');
+
+    } catch (error) {
+      console.error('Error during database cleanup:', error);
+      alert('حدث خطأ غير متوقع أثناء عملية التنظيف، برجاء التحقق من الصلاحيات.');
+    } finally {
+      setIsCleaning(false);
+    }
+  };
+
   // 🔥 ميزة تصدير تقرير الإكسيل الاحترافي المباشر من Firestore
   const exportToExcel = async () => {
     if (!startDate || !endDate) {
@@ -280,7 +357,6 @@ export default function AdminPanel() {
     }
     setIsExporting(true);
     try {
-      // جلب مباشر وآمن من الـ Firestore بدون الاعتماد على الـ state الحالية لتفادي مشكلة التصفير
       const bookingsRef = collection(db, 'bookings');
       const q = query(
         bookingsRef,
@@ -297,7 +373,6 @@ export default function AdminPanel() {
         return;
       }
 
-      // تصفية الحجوزات لتشمل فقط الطبيب النشط حالياً ليكون التقرير دقيقاً ومخصصاً لشفت هذا الدكتور
       const doctorSpecificBookings = fetchedBookings.filter(b => b.doctorId === selectedDoctor);
 
       if (doctorSpecificBookings.length === 0) {
@@ -306,7 +381,6 @@ export default function AdminPanel() {
         return;
       }
 
-      // بناء محتوى ملف الـ CSV وتحديد العناوين الرئيسية
       const headers = ['رقم الدور', 'اسم المريض', 'رقم الهاتف', 'طريقة الدفع', 'حالة الدفع', 'حالة الحجز', 'التاريخ', 'وقت الطلب'];
       
       const rows = doctorSpecificBookings.map(b => {
@@ -329,19 +403,16 @@ export default function AdminPanel() {
         ];
       });
 
-      // دمج العناوين مع الصفوف بفواصل ومراعاة الفاصلة لملفات الـ CSV
       const csvContent = [
         headers.join(','),
         ...rows.map(row => row.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))
       ].join('\n');
 
-      // استخدام الـ BOM (\uFEFF) السحري لإجبار Excel على قراءة الملف بترميز UTF-8 ودعم الحروف العربية بالكامل
       const blob = new Blob([`\uFEFF${csvContent}`], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
       
-      // تسمية الملف باسم الدكتور والفترة لسهولة الفهرسة والأرشفة للمحاسب
       const docName = currentDocData ? currentDocData.name.replace(/\s+/g, '_') : 'doctor';
       link.setAttribute('download', `تقرير_حسابات_${docName}_من_${startDate}_إلى_${endDate}.csv`);
       document.body.appendChild(link);
@@ -410,7 +481,7 @@ export default function AdminPanel() {
         {/* العمود الجانبي المليء بالخصائص والأزرار والمبيعات */}
         <div className="space-y-5 lg:col-span-1">
           
-          {/* 🔥 كارت تقفيل الشفت وتصدير تقارير الحسابات المضافة حديثاً */}
+          {/* 🔥 كارت تقفيل الشفت وتصدير تقارير الحسابات */}
           <div className="bg-linear-to-br from-amber-50 to-orange-50/60 p-5 rounded-3xl shadow-xs border border-amber-200 space-y-3.5">
             <p className="font-black text-amber-900 text-xs flex items-center gap-1.5">📊 تقفيل الشفت وتصدير الحسابات (Excel):</p>
             <div className="grid grid-cols-2 gap-2 text-[11px]">
@@ -429,6 +500,32 @@ export default function AdminPanel() {
               className="w-full bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white text-xs font-black py-2.5 rounded-xl shadow-md transition-all cursor-pointer text-center flex items-center justify-center gap-2"
             >
               {isExporting ? '⏳ جاري استخراج البيانات...' : '📥 تحميل تقرير الحسابات (Excel)'}
+            </button>
+          </div>
+
+          {/* 🔥 كارت التنظيف الدوري وتفريغ مساحة السيرفر للمالك الرئيسي (مضاف حديثاً بأمان مزدوج) */}
+          <div className="bg-linear-to-br from-rose-50 to-red-50/60 p-5 rounded-3xl shadow-xs border border-rose-200 space-y-3.5">
+            <p className="font-black text-rose-900 text-xs flex items-center gap-1.5">⚠️ الصيانة الدورية وتفريغ مساحة السيرفر:</p>
+            <p className="text-[10px] text-slate-500 font-bold leading-relaxed">
+              لتفادي امتلاء المساحة المجانية، يمكنك حذف سجلات المرضى وصور الإيصالات القديمة نهائياً من السيرفر بضغطة واحدة وبأمان المالك.
+            </p>
+            
+            <div className="text-[11px]">
+              <label className="block text-slate-600 font-bold mb-1">حذف كل السجلات ما قبل تاريخ:</label>
+              <input 
+                type="date" 
+                value={cleanUpDate} 
+                onChange={(e) => setCleanUpDate(e.target.value)} 
+                className="w-full p-2 rounded-xl border border-rose-200 bg-white font-bold text-slate-800 outline-none text-center" 
+              />
+            </div>
+            
+            <button 
+              onClick={handleDataCleanup} 
+              disabled={isCleaning}
+              className="w-full bg-rose-600 hover:bg-rose-700 disabled:bg-rose-400 text-white text-xs font-black py-2.5 rounded-xl shadow-md transition-all cursor-pointer text-center flex items-center justify-center gap-2"
+            >
+              {isCleaning ? '⏳ جاري مسح السجلات والصور...' : '🗑️ إخلاء مساحة السيرفر وحذف القديم'}
             </button>
           </div>
 
@@ -522,12 +619,12 @@ export default function AdminPanel() {
               </div>
             </div>
 
-            <form onSubmit={handleChangePassword} className="bg-slate-50 border border-slate-200 p-4 rounded-2xl space-y-2.5">
+            <div className="bg-slate-50 border border-slate-200 p-4 rounded-2xl space-y-2.5">
               <p className="block text-[11px] font-black text-slate-800">🔐 تعديل كلمة مرور الدخول للوحة:</p>
               <input type="password" required placeholder="كلمة المرور القديمة..." value={oldPasswordInput} onChange={(e) => setOldPasswordInput(e.target.value)} className="w-full p-2 rounded-xl border border-slate-200 text-xs text-center bg-white text-slate-800 outline-none focus:ring-2 focus:ring-blue-500"/>
               <input type="password" required placeholder="كلمة المرور الجديدة..." value={newPasswordInput} onChange={(e) => setNewPasswordInput(e.target.value)} className="w-full p-2 rounded-xl border border-slate-200 text-xs text-center bg-white text-slate-800 outline-none focus:ring-2 focus:ring-blue-500"/>
-              <button type="submit" className="w-full bg-slate-900 text-white font-black text-[10px] py-2 rounded-xl cursor-pointer">حفظ كلمة المرور الجديدة 💾</button>
-            </form>
+              <button onClick={handleChangePassword} className="w-full bg-slate-900 text-white font-black text-[10px] py-2 rounded-xl cursor-pointer">حفظ كلمة المرور الجديدة 💾</button>
+            </div>
 
             <div className="bg-emerald-950 text-emerald-50 p-4 rounded-2xl text-center">
               <p className="text-[10px] font-bold text-emerald-400">إجمالي إيرادات العيادة المعتمدة اليوم</p>
@@ -601,92 +698,28 @@ export default function AdminPanel() {
           {/* جدول طابور الانتظار الكامل */}
           <div className="bg-white p-5 rounded-3xl shadow-xs border border-slate-200">
             <h3 className="text-xs font-black text-slate-800 mb-4">👥 طابور الانتظار الفعلي اليوم ({waitingList.length} مرضى)</h3>
-            <div className="overflow-x-auto">
-              {waitingList.length === 0 ? (
-                <p className="text-[11px] text-slate-400 text-center py-8 font-bold">لا يوجد مرضى في طابور الانتظار حالياً.</p>
-              ) : (
-                <table className="w-full text-right text-xs border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-100 text-slate-400 font-black">
-                      <th className="pb-2">رقم الدور</th>
-                      <th className="pb-2">اسم المريض</th>
-                      <th className="pb-2">رقم الهاتف</th>
-                      <th className="pb-2 text-center">نوع الدفع / المستند</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {waitingList.map((b) => (
-                      <tr key={b.id} className="text-slate-700 hover:bg-slate-50/80 transition-colors">
-                        <td className="py-3 font-mono font-black text-blue-600 text-sm">#{b.queueNumber}</td>
-                        <td className="py-3 font-bold text-slate-900">{b.patientName}</td>
-                        <td className="py-3 font-mono">{b.senderPhone || '-'}</td>
-                        <td className="py-3 text-center">
-                          <div className="flex items-center justify-center gap-2">
-                            {renderPaymentOption(b)}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+            <div className="space-y-2">
+              {waitingList.map(b => (
+                <div key={b.id} className="p-3 bg-slate-50 border border-slate-200 rounded-2xl flex items-center justify-between text-xs font-bold text-slate-700">
+                  <span>{b.patientName}</span>
+                  <span className="bg-slate-900 text-white px-2 py-1 rounded-lg">#{b.queueNumber}</span>
+                </div>
+              ))}
             </div>
           </div>
 
-          {/* سجل الحالات التي تم الانتهاء منها اليوم */}
-          <div className="bg-white p-5 rounded-3xl shadow-xs border border-slate-200 border-r-4 border-r-emerald-600">
-            <h3 className="text-xs font-black text-emerald-700 mb-4">✅ الحالات التي تم الانتهاء من كشفها اليوم ({completedList.length} حالات)</h3>
-            <div className="overflow-x-auto">
-              {completedList.length === 0 ? (
-                <p className="text-[11px] text-slate-400 text-center py-6 font-bold">لم يتم الانتهاء من أي حالة حتى الآن اليوم. 📑</p>
-              ) : (
-                <table className="w-full text-right text-xs border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-100 text-slate-400 font-black">
-                      <th className="pb-2">رقم الدور</th>
-                      <th className="pb-2">اسم المريض</th>
-                      <th className="pb-2">رقم الهاتف</th>
-                      <th className="pb-2 text-center">خيارات الإجراءات</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {completedList.map((b) => (
-                      <tr key={b.id} className="text-slate-600 bg-emerald-50/30 hover:bg-emerald-50/60 transition-colors">
-                        <td className="py-3 font-mono font-bold text-emerald-700 line-through text-sm">#{b.queueNumber}</td>
-                        <td className="py-3 font-bold text-slate-800 line-through">{b.patientName}</td>
-                        <td className="py-3 font-mono opacity-70">{b.senderPhone || '-'}</td>
-                        <td className="py-3 text-center">
-                          <div className="flex items-center justify-center gap-2">
-                            {b.paymentMethod !== 'clinic' && (
-                              <button onClick={() => setActiveScreenshot(b.screenshot)} className="bg-slate-200 text-slate-800 px-2 py-1 rounded-md text-[10px] font-black hover:bg-slate-300 cursor-pointer">🖼️ معاينة</button>
-                            )}
-                            <button onClick={() => handleStatusChange(b.id, 'waiting')} className="bg-amber-100 text-amber-800 px-2 py-1 rounded-md text-[10px] font-black hover:bg-amber-600 hover:text-white transition-all cursor-pointer">
-                              🔄 إرجاع لطابور الانتظار
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+          {/* المودال الخاص بمعاينة الإيصالات المنبثقة */}
+          {activeScreenshot && (
+            <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+              <div className="bg-white rounded-3xl p-4 max-w-lg w-full text-center space-y-4 shadow-2xl">
+                <img src={activeScreenshot} alt="Receipt" className="max-h-[70vh] object-contain rounded-2xl mx-auto shadow-md" />
+                <button onClick={() => setActiveScreenshot(null)} className="bg-rose-600 text-white font-black text-xs px-5 py-2.5 rounded-xl cursor-pointer hover:bg-rose-700 transition-colors">❌ إغلاق المعاينة</button>
+              </div>
             </div>
-          </div>
+          )}
 
         </div>
       </div>
-
-      {/* موديول المعاينة المنبثق للإيصالات */}
-      {activeScreenshot && (
-        <div className="fixed inset-0 bg-black/80 flex flex-col justify-center items-center p-4 z-50">
-          <div className="w-full max-w-sm bg-white rounded-3xl p-4 shadow-2xl relative text-center space-y-3">
-            <div className="border border-slate-100 rounded-2xl overflow-hidden max-h-96 bg-slate-50 flex items-center justify-center">
-              <img src={activeScreenshot} alt="Receipt" className="max-w-full max-h-96 object-contain"/>
-            </div>
-            <button onClick={() => setActiveScreenshot(null)} className="w-full bg-slate-900 text-white text-xs font-black py-2.5 rounded-xl cursor-pointer">إغلاق المعاينة ❌</button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
