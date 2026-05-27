@@ -22,17 +22,44 @@ export default function BookingForm() {
   const [ticketPrice, setTicketPrice] = useState(200);
   const [transferNumber, setTransferNumber] = useState('01012345678');
   
-  // حالة التحكم العامة (مفتوح تلقائياً)
   const [isBookingOpen, setIsBookingOpen] = useState(true);
-
-  // حالة التحكم الخاصة بالدكتور المحدد
   const [isCurrentDocOpen, setIsCurrentDocOpen] = useState(true);
 
-  const convertToBase64 = (file) => {
+  // حالات التحكم الحية المربوطة بلوحة القيادة والأدمن
+  const [isVodafoneEnabled, setIsVodafoneEnabled] = useState(true);
+  const [isInstapayEnabled, setIsInstapayEnabled] = useState(true);
+  const [isClinicEnabled, setIsClinicEnabled] = useState(true);
+
+  // دالة ذكية لضغط الصورة وتحويلها لـ Base64 بحجم صغير جداً لحل مشكلة فشل الرفع
+  const compressAndConvertToBase64 = (file) => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.readAsDataURL(file);
-      reader.onload = () => resolve(reader.result);
+      reader.onload = (event) => {
+        const img = new Image();
+        img.src = event.target.result;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX_WIDTH = 600; // تصغير العرض ليكون مناسباً للموبايل والمطابقة
+          const scaleSize = MAX_WIDTH / img.width;
+          
+          if (img.width > MAX_WIDTH) {
+            canvas.width = MAX_WIDTH;
+            canvas.height = img.height * scaleSize;
+          } else {
+            canvas.width = img.width;
+            canvas.height = img.height;
+          }
+
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          
+          // ضغط الجودة بنسبة 60% لتقليل المساحة تماماً لنص خفيف جداً
+          const base64 = canvas.toDataURL('image/jpeg', 0.6);
+          resolve(base64);
+        };
+        img.onerror = (error) => reject(error);
+      };
       reader.onerror = (error) => reject(error);
     });
   };
@@ -47,8 +74,8 @@ export default function BookingForm() {
     }
     if (!rawTimeText && timeValue && typeof timeValue === 'object') {
       const fromTime = timeValue.from || timeValue.start || '';
-      const toTime = timeValue.to || timeValue.end || '';
-      if (fromTime && toTime) rawTimeText = `من ${fromTime} إلى ${toTime}`;
+      const textToTime = timeValue.to || timeValue.end || '';
+      if (fromTime && textToTime) rawTimeText = `من ${fromTime} إلى ${textToTime}`;
       else if (fromTime) rawTimeText = `من ${fromTime}`;
     }
     if (!rawTimeText && timeValue && typeof timeValue !== 'object') rawTimeText = String(timeValue);
@@ -84,13 +111,9 @@ export default function BookingForm() {
     const unsub = onSnapshot(collection(db, 'doctors'), (snapshot) => {
       const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       setDoctors(list);
-      
       const uniqueSpecs = [...new Set(list.map(d => d.specialty || 'عيادة عامة'))];
       setSpecialties(uniqueSpecs);
-      
-      if (uniqueSpecs.length > 0 && !selectedSpecialty) {
-        setSelectedSpecialty(uniqueSpecs[0]);
-      }
+      if (uniqueSpecs.length > 0 && !selectedSpecialty) setSelectedSpecialty(uniqueSpecs[0]);
     });
 
     const unsubSpecs = onSnapshot(doc(db, 'settings', 'clinic_specs'), (docSnap) => {
@@ -99,11 +122,30 @@ export default function BookingForm() {
         if (data.ticketPrice) setTicketPrice(Number(data.ticketPrice));
         if (data.transferNumber) setTransferNumber(data.transferNumber);
         if (data.isBookingOpen !== undefined) setIsBookingOpen(data.isBookingOpen);
+        
+        // استقطاب إعدادات تشغيل بوابات الدفع حياً من الأدمن
+        if (data.isVodafoneEnabled !== undefined) setIsVodafoneEnabled(data.isVodafoneEnabled);
+        if (data.isInstapayEnabled !== undefined) setIsInstapayEnabled(data.isInstapayEnabled);
+        if (data.isClinicEnabled !== undefined) setIsClinicEnabled(data.isClinicEnabled);
       }
     });
 
     return () => { unsub(); unsubSpecs(); };
   }, []);
+
+  // تحويل طريقة الدفع تلقائياً إلى خيار متاح في حال قام المسؤول بتعطيل الخيار الافتراضي الحالي
+  useEffect(() => {
+    if (paymentMethod === 'vodafone' && !isVodafoneEnabled) {
+      if (isInstapayEnabled) setPaymentMethod('instapay');
+      else if (isClinicEnabled) setPaymentMethod('clinic');
+    } else if (paymentMethod === 'instapay' && !isInstapayEnabled) {
+      if (isVodafoneEnabled) setPaymentMethod('vodafone');
+      else if (isClinicEnabled) setPaymentMethod('clinic');
+    } else if (paymentMethod === 'clinic' && !isClinicEnabled) {
+      if (isVodafoneEnabled) setPaymentMethod('vodafone');
+      else if (isInstapayEnabled) setPaymentMethod('instapay');
+    }
+  }, [isVodafoneEnabled, isInstapayEnabled, isClinicEnabled, paymentMethod]);
 
   useEffect(() => {
     if (selectedSpecialty) {
@@ -197,11 +239,12 @@ export default function BookingForm() {
     if (!isBookingOpen) { alert('❌ نعتذر منك، استقبال الحجوزات مغلق حالياً من قبل إدارة العيادة.'); return; }
     if (!isCurrentDocOpen) { alert('❌ نعتذر منك، استقبال الحجوزات لهذا الطبيب مغلق حالياً بطلب من السكرتارية.'); return; }
     if (!selectedDoctor) { alert('❌ من فضلك اختر الدكتور المطلوب أولاً!'); return; }
-    if (!file) { alert('❌ من فضلك قم برفع صورة إيصال التحويل أولاً!'); return; }
+    if (paymentMethod !== 'clinic' && !file) { alert('❌ من فضلك قم برفع صورة إيصال التحويل أولاً!'); return; }
     
     setLoading(true);
     try {
-      const base64Image = await convertToBase64(file);
+      // استخدام الدالة المخصصة لضغط مساحة الصورة
+      const base64Image = paymentMethod === 'clinic' ? 'الدفع في العيادة' : await compressAndConvertToBase64(file);
       const today = new Date();
       const todayStr = today.toLocaleDateString('fr-CA'); 
 
@@ -211,39 +254,57 @@ export default function BookingForm() {
         paymentMethod,
         screenshot: base64Image, 
         doctorId: selectedDoctor,
-        paymentStatus: 'pending',
+        paymentStatus: paymentMethod === 'clinic' ? 'confirmed' : 'pending',
         status: 'waiting',
         queueNumber: 0,
         bookingDateStr: todayStr,
         createdAtDateStr: todayStr,
         createdAt: serverTimestamp()
       });
-      alert('🚀 تم إرسال طلب الحجز بنجاح!');
+      alert(paymentMethod === 'clinic' ? '🚀 تم تسجيل حجزك (الدفع في العيادة) بنجاح!' : '🚀 تم إرسال طلب الحجز بنجاح!');
       setPatientName(''); setSenderPhone(''); setFile(null);
     } catch (error) {
       console.error(error);
       alert('حدث خطأ أثناء رفع البيانات، حاول مرة أخرى.');
-    } finally { setLoading(false); }
+    } finally { 
+      setLoading(false); 
+    }
   };
 
-  // حالة فحص التعطيل لباقي حقول الإدخال (الاسم، الفون، الإيصال)
+  const handleClearSearch = () => {
+    setSearchPhone('');
+    setSearchResults([]);
+    setHasSearched(false);
+  };
+
   const isInputsDisabled = !isBookingOpen || !isCurrentDocOpen || filteredDoctors.length === 0;
+  const isAllPaymentsDisabled = !isVodafoneEnabled && !isInstapayEnabled && !isClinicEnabled;
 
   return (
     <div className="min-h-screen bg-slate-50 p-4 md:p-6 font-sans flex flex-col items-center gap-6" dir="rtl">
       
-      {/* قسم الاستعلام عن الدور الفعلي */}
       <div className="w-full max-w-xl bg-slate-900 text-white rounded-3xl shadow-xl p-5 md:p-6 space-y-4">
-        <div className="flex items-center gap-2">
-          <span className="text-2xl">🔍</span>
-          <div>
-            <h3 className="text-sm font-black">استعلام فوري وبثبات تام عن دورك الفعلي الآن</h3>
-            <p className="text-[10px] text-slate-400 font-bold">اكتب رقم الهاتف الذي حجزت به لمتابعة الحجوزات ومكانها في الطابور</p>
+        <div className="flex justify-between items-center gap-2 border-b border-slate-800 pb-3">
+          <div className="flex items-center gap-2">
+            <span className="text-2xl">🔍</span>
+            <div>
+              <h3 className="text-sm font-black">استعلام فوري وبثبات تام عن دورك الفعلي الآن</h3>
+              <p className="text-[10px] text-slate-400 font-bold">اكتب رقم الهاتف الذي حجزت به لمتابعة الحجوزات ومكانها في الطابور</p>
+            </div>
           </div>
+          {(searchPhone || hasSearched) && (
+            <button 
+              type="button"
+              onClick={handleClearSearch}
+              className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-3 py-1.5 rounded-xl text-[11px] font-black transition-all cursor-pointer border border-slate-700/60 shrink-0"
+            >
+              ⬅️ عودة للحجز
+            </button>
+          )}
         </div>
+
         <input type="tel" placeholder="اكتب رقم الهاتف المسجل به هنا..." value={searchPhone} onChange={(e) => setSearchPhone(e.target.value)} className="w-full p-3 rounded-xl bg-slate-800 text-white placeholder-slate-500 border border-slate-700 outline-none text-xs font-bold text-center tracking-wider focus:border-blue-500"/>
         
-        {/* نتائج البحث */}
         {hasSearched && (
           <div className="space-y-4 pt-2">
             {searchResults.length > 0 ? (
@@ -260,7 +321,9 @@ export default function BookingForm() {
                   </div>
                   <div className="flex justify-between items-center border-b border-slate-700/60 pb-2.5">
                     <span className="text-slate-400 font-bold">حالة المراجعة المالية:</span>
-                    {result.paymentStatus === 'pending' ? (
+                    {result.paymentMethod === 'clinic' ? (
+                      <span className="bg-emerald-500/20 text-emerald-400 font-black px-2.5 py-0.5 rounded-md text-[10px]">🏥 الدفع في العيادة</span>
+                    ) : result.paymentStatus === 'pending' ? (
                       <span className="bg-amber-500/20 text-amber-400 font-black px-2.5 py-0.5 rounded-md text-[10px] animate-pulse">⏳ في انتظار تأكيد السكرتيرة</span>
                     ) : (
                       <span className="bg-emerald-500/20 text-emerald-400 font-black px-2.5 py-0.5 rounded-md text-[10px]">✅ تم الاعتماد المالي</span>
@@ -283,14 +346,20 @@ export default function BookingForm() {
             ) : (
               <p className="text-center text-rose-400 font-bold py-3 bg-slate-800 border border-slate-700 rounded-2xl text-xs">❌ لا يوجد أي حجز نشط مسجل بهذا الرقم لليوم.</p>
             )}
+            <div className="flex justify-center pt-1">
+              <button
+                type="button"
+                onClick={handleClearSearch}
+                className="w-full bg-slate-800 hover:bg-slate-750 text-blue-400 hover:text-blue-300 py-2.5 rounded-xl text-xs font-black transition-all cursor-pointer border border-slate-700/50"
+              >
+                🔄 تنظيف البحث والعودة لتقديم حجز جديد
+              </button>
+            </div>
           </div>
         )}
       </div>
 
-      {/* نموذج الحجز */}
       <div className="w-full max-w-xl bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden">
-        
-        {/* التنبيه العلوي اللحظي */}
         {!isBookingOpen ? (
           <div className="bg-rose-600 text-white p-4 text-center text-xs font-black animate-pulse flex items-center justify-center gap-1.5">
             <span>🛑 نعتذر منكم: الحجوزات الإلكترونية مغلقة مؤقتاً الآن بطلب من السكرتارية.</span>
@@ -306,9 +375,7 @@ export default function BookingForm() {
           </div>
         )}
 
-        {/* تم إزالة كلاس التجمد الكلي للفورم وبقت القوائم حرة وقابلة للضغط دايماً */}
         <form onSubmit={handleSubmit} className="p-5 md:p-6 space-y-5">
-          
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-1">
               <label className="block text-xs font-black text-slate-700">1. اختر التخصص الطبي (العيادة):</label>
@@ -350,57 +417,81 @@ export default function BookingForm() {
             </div>
           )}
           
-          {/* الحقول الباقية هي اللي بيتم قفلها بس عشان المريض ميكملش بيانات ودخوله مرفوض */}
-          <div className={`space-y-5 transition-opacity ${isInputsDisabled ? 'opacity-40 pointer-events-none select-none' : ''}`}>
+          <div className={`space-y-5 transition-opacity ${(isInputsDisabled || isAllPaymentsDisabled) ? 'opacity-40 pointer-events-none select-none' : ''}`}>
             <div className="space-y-1">
               <label className="block text-xs font-black text-slate-700">3. اسم المريض بالكامل:</label>
-              <input type="text" required disabled={isInputsDisabled} placeholder="اكتب الاسم ثلاثي لتسهيل المطابقة" value={patientName} onChange={(e) => setPatientName(e.target.value)} className="w-full p-3 rounded-xl border border-slate-200 text-xs text-slate-800 font-bold outline-none"/>
+              <input type="text" required disabled={isInputsDisabled || isAllPaymentsDisabled} placeholder="اكتب الاسم ثلاثي لتسهيل المطابقة" value={patientName} onChange={(e) => setPatientName(e.target.value)} className="w-full p-3 rounded-xl border border-slate-200 text-xs text-slate-800 font-bold outline-none"/>
             </div>
             
             <div className="space-y-1">
               <label className="block text-xs font-black text-slate-700">4. رقم الموبايل (المستخدم للحجز والاستعلام):</label>
-              <input type="tel" required disabled={isInputsDisabled} placeholder="اكتب رقم موبايل صحيح ومتاح" value={senderPhone} onChange={(e) => setSenderPhone(e.target.value)} className="w-full p-3 rounded-xl border border-slate-200 text-xs font-mono text-center text-slate-800 font-black tracking-widest outline-none"/>
+              <input type="tel" required disabled={isInputsDisabled || isAllPaymentsDisabled} placeholder="اكتب رقم موبايل صحيح ومتاح" value={senderPhone} onChange={(e) => setSenderPhone(e.target.value)} className="w-full p-3 rounded-xl border border-slate-200 text-xs font-mono text-center text-slate-800 font-black tracking-widest outline-none"/>
             </div>
             
             <div className="space-y-2">
-              <label className="block text-xs font-black text-slate-700">5. طريقة الدفع الإلكتروني المعتمدة للكشف:</label>
-              <div className="grid grid-cols-2 gap-3">
-                <label className={`p-3 rounded-xl border-2 flex items-center justify-center gap-2 cursor-pointer transition-all ${paymentMethod === 'vodafone' && filteredDoctors.length > 0 ? 'border-red-500 bg-red-50 text-red-700 font-black' : 'border-slate-100 text-slate-600 font-bold'} ${isInputsDisabled ? 'cursor-not-allowed' : ''}`}>
-                  <input type="radio" name="pay" value="vodafone" checked={paymentMethod === 'vodafone'} onChange={() => setPaymentMethod('vodafone')} className="hidden" disabled={isInputsDisabled}/>🔴 فودافون كاش
-                </label>
-                <label className={`p-3 rounded-xl border-2 flex items-center justify-center gap-2 cursor-pointer transition-all ${paymentMethod === 'instapay' && filteredDoctors.length > 0 ? 'border-pink-500 bg-pink-50 text-pink-700 font-black' : 'border-slate-100 text-slate-600 font-bold'} ${isInputsDisabled ? 'cursor-not-allowed' : ''}`}>
-                  <input type="radio" name="pay" value="instapay" checked={paymentMethod === 'instapay'} onChange={() => setPaymentMethod('instapay')} className="hidden" disabled={isInputsDisabled}/>⚡ تطبيق إنستا باي
-                </label>
-              </div>
-              {filteredDoctors.length > 0 && (
+              <label className="block text-xs font-black text-slate-700">5. طريقة الدفع المعتمدة للكشف:</label>
+              {isAllPaymentsDisabled ? (
+                <div className="p-3 bg-rose-50 text-rose-700 border border-rose-200 rounded-xl text-xs font-black text-center">
+                  ⚠️ عذراً، جميع خيارات وطرق الدفع معطلة حالياً من قبل الإدارة.
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 gap-2">
+                  {isVodafoneEnabled && (
+                    <label className={`p-3 rounded-xl border-2 flex items-center justify-center gap-1 cursor-pointer transition-all ${paymentMethod === 'vodafone' && filteredDoctors.length > 0 ? 'border-red-500 bg-red-50 text-red-700 font-black' : 'border-slate-100 text-slate-600 font-bold'} ${isInputsDisabled ? 'cursor-not-allowed' : ''}`}>
+                      <input type="radio" name="pay" value="vodafone" checked={paymentMethod === 'vodafone'} onChange={() => setPaymentMethod('vodafone')} className="hidden" disabled={isInputsDisabled}/>🔴 فودافون
+                    </label>
+                  )}
+                  {isInstapayEnabled && (
+                    <label className={`p-3 rounded-xl border-2 flex items-center justify-center gap-1 cursor-pointer transition-all ${paymentMethod === 'instapay' && filteredDoctors.length > 0 ? 'border-pink-500 bg-pink-50 text-pink-700 font-black' : 'border-slate-100 text-slate-600 font-bold'} ${isInputsDisabled ? 'cursor-not-allowed' : ''}`}>
+                      <input type="radio" name="pay" value="instapay" checked={paymentMethod === 'instapay'} onChange={() => setPaymentMethod('instapay')} className="hidden" disabled={isInputsDisabled}/>⚡ إنستا باي
+                    </label>
+                  )}
+                  {isClinicEnabled && (
+                    <label className={`p-3 rounded-xl border-2 flex items-center justify-center gap-1 cursor-pointer transition-all ${paymentMethod === 'clinic' && filteredDoctors.length > 0 ? 'border-blue-500 bg-blue-50 text-blue-700 font-black' : 'border-slate-100 text-slate-600 font-bold'} ${isInputsDisabled ? 'cursor-not-allowed' : ''}`}>
+                      <input type="radio" name="pay" value="clinic" checked={paymentMethod === 'clinic'} onChange={() => setPaymentMethod('clinic')} className="hidden" disabled={isInputsDisabled}/>🏥 بالعيادة
+                    </label>
+                  )}
+                </div>
+              )}
+
+              {filteredDoctors.length > 0 && paymentMethod !== 'clinic' && !isAllPaymentsDisabled && (
                 <div className="bg-slate-50 border border-slate-200 p-3 rounded-xl text-[11px] text-slate-600 font-bold text-center">
                   قيمة الكشف: <span className="text-slate-900 font-black text-xs">{ticketPrice} ج.م</span> تُحول للرقم: <span className="font-mono text-blue-600 text-xs font-black select-all tracking-wider">{transferNumber}</span>
                 </div>
               )}
+              {filteredDoctors.length > 0 && paymentMethod === 'clinic' && !isAllPaymentsDisabled && (
+                <div className="bg-blue-50 border border-blue-100 p-3 rounded-xl text-[11px] text-blue-800 font-bold text-center">
+                  💡 سيتم حجز دورك مباشرة بقيمة <span className="font-black text-xs text-slate-900">{ticketPrice} ج.م</span> وتدفع كاش فور وصولك لمقر العيادة.
+                </div>
+              )}
             </div>
             
-            <div className="space-y-1">
-              <label className="block text-xs font-black text-slate-700">6. ارفع سكرين شوت (إيصال التحويل الناجح):</label>
-              <div className={`border-2 border-dashed border-slate-200 rounded-2xl p-4 text-center relative transition-colors ${!isInputsDisabled ? 'hover:border-blue-400 bg-slate-50/50' : 'bg-slate-100'}`}>
-                <input type="file" accept="image/*" onChange={(e) => setFile(e.target.files[0])} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" disabled={isInputsDisabled}/>
-                <div className="space-y-1">
-                  <p className="text-2xl">📸</p>
-                  <p className="text-xs font-black text-slate-700">{file ? `✅ تم اختيار: ${file.name}` : 'اضغط هنا لرفع صورة الإيصال المالي المعتمد'}</p>
+            {paymentMethod !== 'clinic' && !isAllPaymentsDisabled && (
+              <div className="space-y-1">
+                <label className="block text-xs font-black text-slate-700">6. ارفع سكرين شوت (إيصال التحويل الناجح):</label>
+                <div className={`border-2 border-dashed border-slate-200 rounded-2xl p-4 text-center relative transition-colors ${!isInputsDisabled ? 'hover:border-blue-400 bg-slate-50/50' : 'bg-slate-100'}`}>
+                  <input type="file" accept="image/*" onChange={(e) => setFile(e.target.files[0])} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-50" disabled={isInputsDisabled}/>
+                  <div className="space-y-1">
+                    <p className="text-2xl">📸</p>
+                    <p className="text-xs font-black text-slate-700">{file ? `✅ تم اختيار: ${file.name}` : 'اضغط هنا لرفع صورة الإيصال المالي المعتمد'}</p>
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
           </div>
           
-          <button type="submit" disabled={loading || isInputsDisabled} className={`w-full text-white font-black text-xs py-3.5 rounded-xl shadow-lg transition-colors ${loading || isInputsDisabled ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 cursor-pointer'}`}>
+          <button type="submit" disabled={loading || isInputsDisabled || isAllPaymentsDisabled} className={`w-full text-white font-black text-xs py-3.5 rounded-xl shadow-lg transition-colors ${loading || isInputsDisabled || isAllPaymentsDisabled ? 'bg-slate-300 text-slate-500 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 cursor-pointer'}`}>
             {!isBookingOpen 
               ? '🛑 الحجز مغلق حالياً من قِبل السكرتارية' 
               : !isCurrentDocOpen 
               ? '⚠️ نعتذر: هذا الدكتور لا يستقبل حجوزات الآن' 
               : filteredDoctors.length === 0 
-              ? '⚠️ لا يمكن الحجز لعدم توافر أطباء اليوم' 
+              ? '⚠️ لا يمكن الحجز لعدم توافر أطباء اليوم'
+              : isAllPaymentsDisabled
+              ? '⚠️ جميع بوابات الدفع معطلة حالياً'
               : loading 
               ? '⏳ جاري الحجز...' 
-              : '🚀 إرسال إيصال الدفع وتأكيد الحجز الفوري'}
+              : '🚀 إرسال الحجز وتأكيد تسجيل البيانات فوراً'}
           </button>
         </form>
       </div>

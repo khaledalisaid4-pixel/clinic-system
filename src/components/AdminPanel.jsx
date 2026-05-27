@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebase';
-import { collection, onSnapshot, doc, updateDoc, writeBatch, getDoc, setDoc } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, writeBatch, setDoc, getDocs, query, where } from 'firebase/firestore';
 
 export default function AdminPanel() {
   const [doctors, setDoctors] = useState([]);
@@ -24,6 +24,16 @@ export default function AdminPanel() {
 
   // حالة التحكم في استقبال الحجوزات للمرضى
   const [isBookingOpen, setIsBookingOpen] = useState(true);
+
+  // حالات التحكم في تفعيل وتعطيل بوابات الدفع
+  const [isVodafoneEnabled, setIsVodafoneEnabled] = useState(true);
+  const [isInstapayEnabled, setIsInstapayEnabled] = useState(true);
+  const [isClinicEnabled, setIsClinicEnabled] = useState(true);
+
+  // 🔥 حالات فلترة تواريخ تصدير الإكسيل (تلقائيًا على تاريخ اليوم)
+  const [startDate, setStartDate] = useState(new Date().toLocaleDateString('fr-CA'));
+  const [endDate, setEndDate] = useState(new Date().toLocaleDateString('fr-CA'));
+  const [isExporting, setIsExporting] = useState(false);
 
   const parseAndRenderSchedule = (rawDayKey, timeValue) => {
     let dayName = rawDayKey;
@@ -80,6 +90,10 @@ export default function AdminPanel() {
         if (data.ticketPrice) setTicketPrice(Number(data.ticketPrice));
         if (data.transferNumber) setTransferNumber(data.transferNumber);
         if (data.isBookingOpen !== undefined) setIsBookingOpen(data.isBookingOpen);
+        
+        if (data.isVodafoneEnabled !== undefined) setIsVodafoneEnabled(data.isVodafoneEnabled);
+        if (data.isInstapayEnabled !== undefined) setIsInstapayEnabled(data.isInstapayEnabled);
+        if (data.isClinicEnabled !== undefined) setIsClinicEnabled(data.isClinicEnabled);
       }
     });
 
@@ -89,7 +103,7 @@ export default function AdminPanel() {
 
       const uniqueSpecs = [...new Set(list.map(d => d.specialty || 'عيادة عامة'))];
       setSpecialties(uniqueSpecs);
-      // تعديل حذر: لا تغير التخصص المختار إذا كان موجوداً بالفعل من قبل
+      
       setSpecialties(prev => {
         if (!selectedSpecialty && uniqueSpecs.length > 0) {
           setSelectedSpecialty(uniqueSpecs[0]);
@@ -105,13 +119,11 @@ export default function AdminPanel() {
     return () => { unsubDocs(); unsubBookings(); unsubSpecs(); unsubPassword(); };
   }, [selectedSpecialty]);
 
-  // ✨ [التعديل الجوهري لمنع القفز لعيادة العظام تلقائياً]
   useEffect(() => {
     if (selectedSpecialty) {
       const filtered = doctors.filter(d => (d.specialty || 'عيادة عامة') === selectedSpecialty);
       setFilteredDoctors(filtered);
       
-      // نتحقق أولاً: هل الدكتور الحالي المختار ينتمي للتخصص الفعلي؟ لو ينتمي سيبه زي ما هو وماتغيروش!
       const isCurrentDocInFiltered = filtered.some(d => d.id === selectedDoctor);
       if (!isCurrentDocInFiltered) {
         if (filtered.length > 0) {
@@ -123,7 +135,7 @@ export default function AdminPanel() {
     }
   }, [selectedSpecialty, doctors, selectedDoctor]);
 
-  // 1. القائمة النشطة الأساسية
+  // تصفية القوائم الحية واليومية بناءً على الطبيب النشط واليوم الحالي
   const activeBookings = bookings.filter(b => {
     const todayStr = new Date().toLocaleDateString('fr-CA'); 
     const matchDoctor = b.doctorId === selectedDoctor;
@@ -131,14 +143,27 @@ export default function AdminPanel() {
     return matchDoctor && matchDate;
   });
 
-  // 2. تصفية القوائم الحية
-  const waitingList = activeBookings.filter(b => b.status === 'waiting' && b.paymentStatus === 'confirmed').sort((a, b) => (a.queueNumber || 0) - (b.queueNumber || 0));
+  // طابور الانتظار: يشمل فقط الحالات التي تم تأكيدها ماليًا ولها رقم دور في الطابور
+  const waitingList = activeBookings.filter(b => b.status === 'waiting' && b.paymentStatus === 'confirmed' && b.queueNumber).sort((a, b) => (a.queueNumber || 0) - (b.queueNumber || 0));
   const patientInside = activeBookings.find(b => b.status === 'inside');
-  const pendingPaymentsList = activeBookings.filter(b => b.paymentStatus === 'pending');
+  
+  // ترتيب المعلق بالأسبقية الزمنية التلقائية بناءً على وقت إنشاء الحجز المريض (الأقدم للأحدث)
+  const pendingPaymentsList = activeBookings.filter(b => {
+    if (b.status === 'archived' || b.status === 'completed' || b.status === 'inside') return false;
+    
+    const isPendingElectronic = b.paymentStatus === 'pending' && b.paymentMethod !== 'clinic';
+    const isUnconfirmedClinic = b.paymentMethod === 'clinic' && !b.queueNumber;
+    
+    return isPendingElectronic || isUnconfirmedClinic;
+  }).sort((a, b) => {
+    const timeA = a.createdAt?.seconds || new Date(a.createdAt).getTime() || 0;
+    const timeB = b.createdAt?.seconds || new Date(b.createdAt).getTime() || 0;
+    return timeA - timeB;
+  });
   
   const completedList = activeBookings.filter(b => b.status === 'completed' || b.status === 'archived').sort((a, b) => (b.queueNumber || 0) - (a.queueNumber || 0));
 
-  const confirmedPaymentsCount = activeBookings.filter(b => b.paymentStatus === 'confirmed').length;
+  const confirmedPaymentsCount = activeBookings.filter(b => b.paymentStatus === 'confirmed' && b.queueNumber).length;
   const totalRevenue = confirmedPaymentsCount * ticketPrice;
 
   const handleLogin = (e) => {
@@ -170,6 +195,21 @@ export default function AdminPanel() {
     try { await setDoc(doc(db, 'settings', 'clinic_specs'), { transferNumber: newNumber }, { merge: true }); } catch (error) { console.error(error); }
   };
 
+  const handleToggleVodafone = async (checked) => {
+    setIsVodafoneEnabled(checked);
+    try { await setDoc(doc(db, 'settings', 'clinic_specs'), { isVodafoneEnabled: checked }, { merge: true }); } catch (error) { console.error(error); }
+  };
+
+  const handleToggleInstapay = async (checked) => {
+    setIsInstapayEnabled(checked);
+    try { await setDoc(doc(db, 'settings', 'clinic_specs'), { isInstapayEnabled: checked }, { merge: true }); } catch (error) { console.error(error); }
+  };
+
+  const handleToggleClinic = async (checked) => {
+    setIsClinicEnabled(checked);
+    try { await setDoc(doc(db, 'settings', 'clinic_specs'), { isClinicEnabled: checked }, { merge: true }); } catch (error) { console.error(error); }
+  };
+
   const toggleBookingStatus = async () => {
     const settingsRef = doc(db, 'settings', 'clinic_specs');
     try {
@@ -181,8 +221,8 @@ export default function AdminPanel() {
 
   const handleConfirmPayment = async (id) => {
     try {
-      const confirmedBookings = activeBookings.filter(b => b.paymentStatus === 'confirmed');
-      const maxQueueNumber = confirmedBookings.reduce((max, b) => (b.queueNumber > max ? b.queueNumber : max), 0);
+      const bookingsWithQueue = activeBookings.filter(b => b.queueNumber);
+      const maxQueueNumber = bookingsWithQueue.reduce((max, b) => (b.queueNumber > max ? b.queueNumber : max), 0);
       const nextQueueNumber = maxQueueNumber + 1;
 
       await updateDoc(doc(db, 'bookings', id), { 
@@ -190,7 +230,7 @@ export default function AdminPanel() {
         status: 'waiting',
         queueNumber: nextQueueNumber
       });
-      alert(`💵 تم اعتماد الإيصال بنجاح وإدراج المريض برقم (#${nextQueueNumber})!`);
+      alert(`💵 تم اعتماد الحالة بنجاح وإدراج المريض برقم (#${nextQueueNumber}) في الطابور!`);
     } catch (error) { console.error(error); }
   };
 
@@ -204,7 +244,6 @@ export default function AdminPanel() {
       return;
     }
     
-    // حفظ المعرف المختار حالياً لمنع تأثره بتبديل الـ State غير المتزامن
     const currentDoctorId = selectedDoctor;
 
     if (patientInside) {
@@ -233,6 +272,99 @@ export default function AdminPanel() {
     } catch (error) { console.error(error); }
   };
 
+  // 🔥 ميزة تصدير تقرير الإكسيل الاحترافي المباشر من Firestore
+  const exportToExcel = async () => {
+    if (!startDate || !endDate) {
+      alert('الرجاء اختيار تاريخ البدء وتاريخ النهاية أولاً! 📅');
+      return;
+    }
+    setIsExporting(true);
+    try {
+      // جلب مباشر وآمن من الـ Firestore بدون الاعتماد على الـ state الحالية لتفادي مشكلة التصفير
+      const bookingsRef = collection(db, 'bookings');
+      const q = query(
+        bookingsRef,
+        where('bookingDateStr', '>=', startDate),
+        where('bookingDateStr', '<=', endDate)
+      );
+      
+      const querySnapshot = await getDocs(q);
+      const fetchedBookings = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+      if (fetchedBookings.length === 0) {
+        alert('لا توجد أي حجوزات مسجلة في هذه الفترة المحددة! 🤷‍♂️');
+        setIsExporting(false);
+        return;
+      }
+
+      // تصفية الحجوزات لتشمل فقط الطبيب النشط حالياً ليكون التقرير دقيقاً ومخصصاً لشفت هذا الدكتور
+      const doctorSpecificBookings = fetchedBookings.filter(b => b.doctorId === selectedDoctor);
+
+      if (doctorSpecificBookings.length === 0) {
+        alert('لا توجد حجوزات لهذا الدكتور بالذات في الفترة المحددة. 👨‍⚕️');
+        setIsExporting(false);
+        return;
+      }
+
+      // بناء محتوى ملف الـ CSV وتحديد العناوين الرئيسية
+      const headers = ['رقم الدور', 'اسم المريض', 'رقم الهاتف', 'طريقة الدفع', 'حالة الدفع', 'حالة الحجز', 'التاريخ', 'وقت الطلب'];
+      
+      const rows = doctorSpecificBookings.map(b => {
+        let payMethodText = b.paymentMethod === 'clinic' ? 'كاش بالعيادة' : 'تحويل إلكتروني';
+        let payStatusText = b.paymentStatus === 'confirmed' ? 'مؤكد ومعتمد' : 'معلق/غير مؤكد';
+        let statusText = 'مؤرشف/منتهي';
+        if (b.status === 'waiting') statusText = 'في الانتظار';
+        if (b.status === 'inside') statusText = 'داخل الكشف';
+        if (b.status === 'completed') statusText = 'مكتمل';
+
+        return [
+          b.queueNumber ? `#${b.queueNumber}` : 'بدون دور',
+          b.patientName || 'بدون اسم',
+          b.senderPhone || 'لا يوجد',
+          payMethodText,
+          payStatusText,
+          statusText,
+          b.bookingDateStr || '',
+          b.createdAtTimeStr || ''
+        ];
+      });
+
+      // دمج العناوين مع الصفوف بفواصل ومراعاة الفاصلة لملفات الـ CSV
+      const csvContent = [
+        headers.join(','),
+        ...rows.map(row => row.map(val => `"${String(val).replace(/"/g, '""')}"`).join(','))
+      ].join('\n');
+
+      // استخدام الـ BOM (\uFEFF) السحري لإجبار Excel على قراءة الملف بترميز UTF-8 ودعم الحروف العربية بالكامل
+      const blob = new Blob([`\uFEFF${csvContent}`], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      
+      // تسمية الملف باسم الدكتور والفترة لسهولة الفهرسة والأرشفة للمحاسب
+      const docName = currentDocData ? currentDocData.name.replace(/\s+/g, '_') : 'doctor';
+      link.setAttribute('download', `تقرير_حسابات_${docName}_من_${startDate}_إلى_${endDate}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+    } catch (error) {
+      console.error('Error exporting snapshot data: ', error);
+      alert('حدث خطأ أثناء تصدير البيانات، برجاء المحاولة لاحقاً.');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const renderPaymentOption = (booking) => {
+    if (booking.paymentMethod === 'clinic') {
+      return <span className="text-[10px] font-black text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-xl border border-emerald-200">🏥 دفع بالعيادة</span>;
+    }
+    return (
+      <button onClick={() => setActiveScreenshot(booking.screenshot)} className="bg-slate-900 text-white px-3 py-2 rounded-xl font-black text-[10px] cursor-pointer hover:bg-slate-800 transition-colors">🖼️ معاينة</button>
+    );
+  };
+
   const currentDocData = doctors.find(d => d.id === selectedDoctor);
 
   if (!isAuthorized) {
@@ -243,7 +375,7 @@ export default function AdminPanel() {
           <h2 className="text-lg font-black text-slate-800">لوحة تحكم السكرتارية والخزينة</h2>
           <form onSubmit={handleLogin} className="space-y-4">
             <input type="password" placeholder="••••••••" value={inputPassword} onChange={(e) => setInputPassword(e.target.value)} className="w-full p-3.5 rounded-2xl border border-slate-200 text-base font-black text-center tracking-widest bg-slate-50 text-slate-800" required/>
-            <button type="submit" className="w-full bg-blue-600 text-white font-black text-xs py-3 rounded-2xl shadow-lg cursor-pointer">🔓 فتح النظام</button>
+            <button type="submit" className="w-full bg-blue-600 text-white font-black text-xs py-3 rounded-2xl shadow-lg cursor-pointer hover:bg-blue-700 transition-colors">🔓 فتح النظام</button>
           </form>
         </div>
       </div>
@@ -275,8 +407,31 @@ export default function AdminPanel() {
 
       <div className="p-4 md:p-6 grid grid-cols-1 lg:grid-cols-3 gap-6 items-start flex-1">
         
-        {/* العمود الجانبي */}
+        {/* العمود الجانبي المليء بالخصائص والأزرار والمبيعات */}
         <div className="space-y-5 lg:col-span-1">
+          
+          {/* 🔥 كارت تقفيل الشفت وتصدير تقارير الحسابات المضافة حديثاً */}
+          <div className="bg-linear-to-br from-amber-50 to-orange-50/60 p-5 rounded-3xl shadow-xs border border-amber-200 space-y-3.5">
+            <p className="font-black text-amber-900 text-xs flex items-center gap-1.5">📊 تقفيل الشفت وتصدير الحسابات (Excel):</p>
+            <div className="grid grid-cols-2 gap-2 text-[11px]">
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">من تاريخ:</label>
+                <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="w-full p-2 rounded-xl border border-amber-200 bg-white font-bold text-slate-800 outline-none text-center" />
+              </div>
+              <div>
+                <label className="block text-slate-600 font-bold mb-1">إلى تاريخ:</label>
+                <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="w-full p-2 rounded-xl border border-amber-200 bg-white font-bold text-slate-800 outline-none text-center" />
+              </div>
+            </div>
+            <button 
+              onClick={exportToExcel} 
+              disabled={isExporting}
+              className="w-full bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white text-xs font-black py-2.5 rounded-xl shadow-md transition-all cursor-pointer text-center flex items-center justify-center gap-2"
+            >
+              {isExporting ? '⏳ جاري استخراج البيانات...' : '📥 تحميل تقرير الحسابات (Excel)'}
+            </button>
+          </div>
+
           <div className="bg-white p-5 rounded-3xl shadow-xs border border-slate-200 space-y-4">
             
             <div className="space-y-2">
@@ -330,6 +485,43 @@ export default function AdminPanel() {
               </div>
             </div>
 
+            {/* قسم التحكم في تشغيل وإيقاف خيارات الدفع للمرضى */}
+            <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50 space-y-2.5 text-[11px]">
+              <p className="font-black text-slate-800 flex items-center gap-1 mb-1">⚙️ تحكم طرق دفع المريض:</p>
+              
+              <div className="space-y-2">
+                <label className="flex items-center justify-between bg-white p-2 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition-all">
+                  <span className="font-bold text-slate-700">🔴 تفعيل فودافون كاش</span>
+                  <input 
+                    type="checkbox" 
+                    checked={isVodafoneEnabled} 
+                    onChange={(e) => handleToggleVodafone(e.target.checked)}
+                    className="w-4 h-4 text-red-600 border-slate-300 rounded focus:ring-red-500 cursor-pointer"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between bg-white p-2 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition-all">
+                  <span className="font-bold text-slate-700">⚡ تفعيل إنستا باي</span>
+                  <input 
+                    type="checkbox" 
+                    checked={isInstapayEnabled} 
+                    onChange={(e) => handleToggleInstapay(e.target.checked)}
+                    className="w-4 h-4 text-pink-600 border-slate-300 rounded focus:pink-red-500 cursor-pointer"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between bg-white p-2 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition-all">
+                  <span className="font-bold text-slate-700">🏥 تفعيل الدفع بالعيادة كاش</span>
+                  <input 
+                    type="checkbox" 
+                    checked={isClinicEnabled} 
+                    onChange={(e) => handleToggleClinic(e.target.checked)}
+                    className="w-4 h-4 text-blue-600 border-slate-300 rounded focus:ring-blue-500 cursor-pointer"
+                  />
+                </label>
+              </div>
+            </div>
+
             <form onSubmit={handleChangePassword} className="bg-slate-50 border border-slate-200 p-4 rounded-2xl space-y-2.5">
               <p className="block text-[11px] font-black text-slate-800">🔐 تعديل كلمة مرور الدخول للوحة:</p>
               <input type="password" required placeholder="كلمة المرور القديمة..." value={oldPasswordInput} onChange={(e) => setOldPasswordInput(e.target.value)} className="w-full p-2 rounded-xl border border-slate-200 text-xs text-center bg-white text-slate-800 outline-none focus:ring-2 focus:ring-blue-500"/>
@@ -346,24 +538,37 @@ export default function AdminPanel() {
           </div>
         </div>
 
-        {/* العمود الرئيسي */}
+        {/* العمود الرئيسي المليء بالجداول ومطابقة البيانات الحية */}
         <div className="lg:col-span-2 space-y-6">
-          {/* إيصالات الدفع المعلقة */}
+          
+          {/* جدول المراجعة والاعتماد */}
           <div className="bg-white p-5 rounded-3xl shadow-xs border border-slate-200">
-            <h3 className="text-xs font-black text-amber-700 mb-4">⏳ إيصالات دفع معلقة تحتاج مراجعة ومطابقة</h3>
+            <h3 className="text-xs font-black text-amber-700 mb-4">⏳ حالات وإيصالات بانتظار المراجعة والاعتماد المالي (مرتبة بالأسبقية ⏱️)</h3>
             <div className="space-y-2.5">
               {pendingPaymentsList.length === 0 ? (
-                <p className="text-[11px] text-slate-400 text-center py-6 font-bold">لا توجد إيصالات دفع معلقة حالياً. ✨</p>
+                <p className="text-[11px] text-slate-400 text-center py-6 font-bold">لا توجد حالات بانتظار المراجعة حالياً. ✨</p>
               ) : (
                 pendingPaymentsList.map(b => (
                   <div key={b.id} className="p-3.5 bg-slate-50/70 border border-slate-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
                     <div>
                       <p className="font-black text-slate-800 text-sm">{b.patientName}</p>
-                      <p className="text-[11px] text-slate-600 font-bold">👤 الرقم المحول: <span className="font-mono text-slate-900 font-black">{b.senderPhone}</span></p>
+                      <p className="text-[11px] text-slate-700 font-bold mt-1">
+                        📞 رقم الموبايل للتواصل: <span className="font-mono text-slate-900 font-black bg-slate-200/60 px-2 py-0.5 rounded text-[12px]">{b.senderPhone || 'لا يوجد رقم'}</span>
+                      </p>
+                      {b.createdAtTimeStr && (
+                        <p className="text-[11px] text-slate-500 font-bold mt-0.5">
+                          ⏱️ وقت طلب الحجز: <span className="font-mono text-blue-700 font-black bg-blue-50 px-1.5 py-0.5 rounded text-[11px]">{b.createdAtTimeStr}</span>
+                        </p>
+                      )}
+                      {b.paymentMethod === 'clinic' ? (
+                        <p className="text-[11px] text-emerald-700 font-bold mt-1.5 flex items-center gap-1">🏥 طريقة الحجز: <span className="font-black bg-emerald-100/50 text-emerald-800 px-1.5 py-0.5 rounded">دفع في العيادة (كاش)</span></p>
+                      ) : (
+                        <p className="text-[11px] text-purple-700 font-bold mt-1.5 flex items-center gap-1">📱 محفظة إلكترونية: <span className="font-black bg-purple-100 text-purple-800 px-1.5 py-0.5 rounded">تم رفع إيصال تحويل</span></p>
+                      )}
                     </div>
                     <div className="flex items-center gap-2">
-                      <button onClick={() => setActiveScreenshot(b.screenshot)} className="bg-slate-900 text-white px-3 py-2 rounded-xl font-black text-[10px] cursor-pointer">🖼️ معاينة</button>
-                      <button onClick={() => handleConfirmPayment(b.id)} className="bg-emerald-600 text-white px-3 py-2 rounded-xl font-black text-[10px] cursor-pointer">✅ اعتماد</button>
+                      {renderPaymentOption(b)}
+                      <button onClick={() => handleConfirmPayment(b.id)} className="bg-emerald-600 text-white px-3 py-2 rounded-xl font-black text-[10px] cursor-pointer hover:bg-emerald-700 transition-colors">✅ اعتماد وإدراج بالطابور</button>
                     </div>
                   </div>
                 ))
@@ -378,8 +583,10 @@ export default function AdminPanel() {
               <div className="p-4 bg-blue-50/50 border border-blue-100 rounded-2xl flex items-center justify-between gap-4">
                 <div className="flex-1">
                   <p className="font-black text-blue-900 text-base">{patientInside.patientName}</p>
-                  <p className="text-[11px] text-slate-500 font-bold mt-0.5">رقم الموبايل: {patientInside.senderPhone}</p>
-                  <button onClick={() => setActiveScreenshot(patientInside.screenshot)} className="mt-2 bg-slate-900 text-white px-3 py-1.5 rounded-lg font-black text-[10px] cursor-pointer">🖼️ معاينة الإيصال</button>
+                  <p className="text-[11px] text-slate-500 font-bold mt-0.5">رقم الموبايل: {patientInside.senderPhone || 'بدون رقم'}</p>
+                  {patientInside.paymentMethod !== 'clinic' && (
+                    <button onClick={() => setActiveScreenshot(patientInside.screenshot)} className="mt-2 bg-slate-900 text-white px-3 py-1.5 rounded-lg font-black text-[10px] cursor-pointer">🖼️ معاينة الإيصال</button>
+                  )}
                 </div>
                 <div className="text-center bg-blue-600 text-white px-4 py-2 rounded-xl min-w-17.5">
                   <p className="text-[9px] font-bold opacity-80">رقم الدور</p>
@@ -404,7 +611,7 @@ export default function AdminPanel() {
                       <th className="pb-2">رقم الدور</th>
                       <th className="pb-2">اسم المريض</th>
                       <th className="pb-2">رقم الهاتف</th>
-                      <th className="pb-2 text-center">خيارات التحكم</th>
+                      <th className="pb-2 text-center">نوع الدفع / المستند</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -412,10 +619,10 @@ export default function AdminPanel() {
                       <tr key={b.id} className="text-slate-700 hover:bg-slate-50/80 transition-colors">
                         <td className="py-3 font-mono font-black text-blue-600 text-sm">#{b.queueNumber}</td>
                         <td className="py-3 font-bold text-slate-900">{b.patientName}</td>
-                        <td className="py-3 font-mono">{b.senderPhone}</td>
+                        <td className="py-3 font-mono">{b.senderPhone || '-'}</td>
                         <td className="py-3 text-center">
                           <div className="flex items-center justify-center gap-2">
-                            <button onClick={() => setActiveScreenshot(b.screenshot)} className="bg-slate-200 text-slate-800 px-2.5 py-1.5 rounded-lg text-[10px] font-black hover:bg-slate-300 transition-all cursor-pointer">🖼️ معاينة</button>
+                            {renderPaymentOption(b)}
                           </div>
                         </td>
                       </tr>
@@ -447,10 +654,12 @@ export default function AdminPanel() {
                       <tr key={b.id} className="text-slate-600 bg-emerald-50/30 hover:bg-emerald-50/60 transition-colors">
                         <td className="py-3 font-mono font-bold text-emerald-700 line-through text-sm">#{b.queueNumber}</td>
                         <td className="py-3 font-bold text-slate-800 line-through">{b.patientName}</td>
-                        <td className="py-3 font-mono opacity-70">{b.senderPhone}</td>
+                        <td className="py-3 font-mono opacity-70">{b.senderPhone || '-'}</td>
                         <td className="py-3 text-center">
                           <div className="flex items-center justify-center gap-2">
-                            <button onClick={() => setActiveScreenshot(b.screenshot)} className="bg-slate-200 text-slate-800 px-2 py-1 rounded-md text-[10px] font-black hover:bg-slate-300 cursor-pointer">🖼️ معاينة</button>
+                            {b.paymentMethod !== 'clinic' && (
+                              <button onClick={() => setActiveScreenshot(b.screenshot)} className="bg-slate-200 text-slate-800 px-2 py-1 rounded-md text-[10px] font-black hover:bg-slate-300 cursor-pointer">🖼️ معاينة</button>
+                            )}
                             <button onClick={() => handleStatusChange(b.id, 'waiting')} className="bg-amber-100 text-amber-800 px-2 py-1 rounded-md text-[10px] font-black hover:bg-amber-600 hover:text-white transition-all cursor-pointer">
                               🔄 إرجاع لطابور الانتظار
                             </button>
@@ -467,7 +676,7 @@ export default function AdminPanel() {
         </div>
       </div>
 
-      {/* موديول المعاينة المنبثق */}
+      {/* موديول المعاينة المنبثق للإيصالات */}
       {activeScreenshot && (
         <div className="fixed inset-0 bg-black/80 flex flex-col justify-center items-center p-4 z-50">
           <div className="w-full max-w-sm bg-white rounded-3xl p-4 shadow-2xl relative text-center space-y-3">
